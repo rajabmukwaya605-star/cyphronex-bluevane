@@ -21,6 +21,15 @@ CREATE INDEX IF NOT EXISTS docs_parent ON docs(parent);`);
 
 for (const e of ADMINS) db.prepare('UPDATE users SET is_admin=1 WHERE email=?').run(e); // promote existing accounts at startup
 
+// Command line: node server.js --make-admin you@example.com  (promotes an existing account, then exits)
+const ci = process.argv.indexOf('--make-admin');
+if (ci > -1) {
+  const em = String(process.argv[ci + 1] || '').trim().toLowerCase();
+  const r = em ? db.prepare('UPDATE users SET is_admin=1 WHERE email=?').run(em) : { changes: 0 };
+  console.log(r.changes ? em + ' is now an administrator.' : 'No account with that email. Create it first, then run this again.');
+  process.exit(0);
+}
+
 /* ---------- helpers ---------- */
 const phoneNorm = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 7 && d.length <= 15 ? d.slice(-9) : null; };
 const emailOk = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 254;
