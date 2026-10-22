@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bluvane · Private chat by Biltech Technologies</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Sora:wght@600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app" class="app" data-view="list" hidden>
+  <aside class="side" aria-label="Conversations">
+    <div class="side-head">
+      <div class="brand"><span id="brandLogo"></span><div><b>Bluvane</b><small>by Biltech Technologies</small></div></div>
+      <div class="head-actions">
+        <button class="icon-btn" id="btnAddContact" aria-label="Add contact by email or phone" title="Add contact"><span data-ic="user-plus"></span></button>
+        <button class="icon-btn" id="btnTheme" aria-label="Switch between light and dark theme"><span data-ic="moon"></span></button>
+        <button class="icon-btn" id="btnAdmin" aria-label="Admin console" hidden><span data-ic="megaphone"></span></button>
+        <button class="icon-btn" id="btnSettings" aria-label="Settings and privacy"><span data-ic="sliders"></span></button>
+      </div>
+    </div>
+    <div class="search"><span data-ic="search" data-size="18"></span><input id="search" type="search" placeholder="Search chats and people" autocomplete="off" aria-label="Search"></div>
+    <div class="tabs" role="tablist">
+      <button role="tab" data-tab="chats" class="on">Chats</button>
+      <button role="tab" data-tab="people">People</button>
+      <button role="tab" data-tab="notices">Notices <span id="noticeBadge" class="badge" hidden></span></button>
+    </div>
+    <div class="list" id="list"></div>
+    <div class="side-foot">
+      <button class="btn ghost small" id="btnNewGroup"><span data-ic="users" data-size="16"></span> New group</button>
+      <button class="btn ghost small" id="btnLock" title="Lock now (Alt+L)"><span data-ic="lock" data-size="16"></span> Lock now</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section id="empty" class="empty">
+      <div class="empty-in">
+        <div id="emptyLogo"></div>
+        <h2>Say it. Only they hear it.</h2>
+        <p class="muted">Add a friend by email or phone number to start a private chat. Everything you send is locked on your device first.</p>
+        <div class="feature-grid">
+          <div class="feature"><b>📇 Add by email or phone</b><span>Find friends and chat one-to-one.</span></div>
+          <div class="feature"><b>🔥 Burn timers</b><span>Messages that delete themselves.</span></div>
+          <div class="feature"><b>⏳ Time capsules</b><span>Seal a message until a date you choose.</span></div>
+          <div class="feature"><b>⏱️ Study sprints</b><span>Type /sprint 25 for a shared countdown.</span></div>
+          <div class="feature"><b>🔐 Safety emojis</b><span>Verify a friend with a few pictures.</span></div>
+          <div class="feature"><b>🫥 Privacy shield</b><span>Blurs chats when you look away.</span></div>
+          <div class="feature"><b>🚨 Panic lock</b><span>Alt+L locks everything instantly.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pane" class="pane" hidden>
+      <header class="chat-head">
+        <button class="icon-btn back" id="btnBack" aria-label="Back to chats"><span data-ic="arrow-left"></span></button>
+        <div id="headAv"></div>
+        <button class="head-title" id="headTitle"><b id="chatTitle"></b><small id="chatSub"></small></button>
+        <button class="icon-btn" id="btnInfo" aria-label="Safety and chat details"><span data-ic="shield-check"></span></button>
+      </header>
+      <div id="banner" class="banner" hidden></div>
+      <div id="msgs" class="msgs" aria-live="polite"></div>
+      <div class="composer-wrap">
+        <div id="chips" class="chips"></div>
+        <div class="composer">
+          <div class="pop-anchor">
+            <button class="icon-btn" id="btnPlus" aria-label="Message options: burn timer, time capsule, sprint, emoji"><span data-ic="plus"></span></button>
+            <div id="pop" class="pop" hidden></div>
+          </div>
+          <textarea id="msg" rows="1" placeholder="Write an encrypted message…" aria-label="Message"></textarea>
+          <button class="send" id="btnSend" aria-label="Send message"><span data-ic="send" data-size="20"></span></button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="gate" class="gate"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="backend.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
