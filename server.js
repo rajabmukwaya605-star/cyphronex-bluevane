@@ -5,7 +5,7 @@ const express = require('express'), http = require('http'), path = require('path
 const { WebSocketServer } = require('ws'), Database = require('better-sqlite3'), bcrypt = require('bcryptjs'), jwt = require('jsonwebtoken');
 
 const PORT = +process.env.PORT || 3000, DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const ADMINS = (process.env.ADMIN_EMAIL || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean); // comma-separated
 fs.mkdirSync(DATA, { recursive: true });
 const secretFile = path.join(DATA, 'jwt.secret');
 const SECRET = process.env.JWT_SECRET || (fs.existsSync(secretFile) ? fs.readFileSync(secretFile, 'utf8') : (() => { const s = crypto.randomBytes(48).toString('hex'); fs.writeFileSync(secretFile, s, { mode: 0o600 }); return s; })());
@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT NOT NULL, email 
 CREATE INDEX IF NOT EXISTS users_phone ON users(phone_norm);
 CREATE TABLE IF NOT EXISTS docs(path TEXT PRIMARY KEY, parent TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS docs_parent ON docs(parent);`);
+
+for (const e of ADMINS) db.prepare('UPDATE users SET is_admin=1 WHERE email=?').run(e); // promote existing accounts at startup
 
 /* ---------- helpers ---------- */
 const phoneNorm = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 7 && d.length <= 15 ? d.slice(-9) : null; };
@@ -103,7 +105,7 @@ app.post('/api/register', (req, res) => {
   if (db.prepare('SELECT 1 FROM users WHERE email=?').get(email)) return res.status(409).json({ error: 'email-taken' });
   const first = !db.prepare('SELECT 1 FROM users LIMIT 1').get(), id = 'u_' + crypto.randomBytes(10).toString('hex');
   db.prepare('INSERT INTO users(id,name,email,phone,phone_norm,pass,is_admin,created) VALUES(?,?,?,?,?,?,?,?)')
-    .run(id, name, email, phone, phoneNorm(phone), bcrypt.hashSync(pw, 11), first || (ADMIN_EMAIL && email === ADMIN_EMAIL) ? 1 : 0, Date.now());
+    .run(id, name, email, phone, phoneNorm(phone), bcrypt.hashSync(pw, 11), first || ADMINS.includes(email) ? 1 : 0, Date.now());
   res.json({ token: token(userById(id)) });
 });
 app.post('/api/login', (req, res) => {
@@ -112,6 +114,24 @@ app.post('/api/login', (req, res) => {
   const u = idn.includes('@') ? db.prepare('SELECT * FROM users WHERE email=?').get(idn) : (phoneNorm(idn) ? db.prepare('SELECT * FROM users WHERE phone_norm=?').get(phoneNorm(idn)) : null);
   if (!u || !bcrypt.compareSync(pw, u.pass)) return res.status(401).json({ error: 'bad-credentials' });
   res.json({ token: token(u) });
+});
+const adminOnly = (req, res, next) => req.user.is_admin ? next() : res.status(403).json({ error: 'denied' });
+app.get('/api/admin/users', auth, adminOnly, (req, res) => {
+  const rows = db.prepare('SELECT id,name,email,phone,created FROM users ORDER BY created DESC').all();
+  res.json({ users: rows.map(u => ({ ...u, ready: !!getDoc('keys/' + u.id) })) });
+});
+app.post('/api/admin/users', auth, adminOnly, (req, res) => {   // admin adds another person
+  const name = String(req.body.name || '').trim().slice(0, 60), email = String(req.body.email || '').trim().toLowerCase(), pw = String(req.body.password || '');
+  const phone = String(req.body.phone || '').trim().slice(0, 30);
+  if (!name) return res.status(400).json({ error: 'name-required' });
+  if (!emailOk(email)) return res.status(400).json({ error: 'bad-email' });
+  if (pw.length < 8) return res.status(400).json({ error: 'weak-password' });
+  if (phone && !phoneNorm(phone)) return res.status(400).json({ error: 'bad-phone' });
+  if (db.prepare('SELECT 1 FROM users WHERE email=?').get(email)) return res.status(409).json({ error: 'email-taken' });
+  const id = 'u_' + crypto.randomBytes(10).toString('hex');
+  db.prepare('INSERT INTO users(id,name,email,phone,phone_norm,pass,is_admin,created) VALUES(?,?,?,?,?,?,?,?)')
+    .run(id, name, email, phone, phoneNorm(phone), bcrypt.hashSync(pw, 11), ADMINS.includes(email) ? 1 : 0, Date.now());
+  res.json({ id });
 });
 app.get('/api/me', auth, (req, res) => res.json(meJson(req.user)));
 app.put('/api/me/phone', auth, (req, res) => {
