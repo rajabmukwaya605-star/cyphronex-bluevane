@@ -208,10 +208,13 @@ function nameOf(id) {
 // points to a user id, so a contact can be found by someone who already knows the address.
 function parseHandle(raw) {
   const s = String(raw || '').trim(); if (!s) return null;
-  if (s.includes('@')) { if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return null; return { kind: 'email', norm: s.toLowerCase() }; }
-  if (!/^[+\d\s().\-]+$/.test(s)) return null;
-  const d = s.replace(/\D/g, ''); if (d.length < 7 || d.length > 15) return null;
-  return { kind: 'phone', norm: d.slice(-9) }; // last 9 digits: matches +256772000000 and 0772000000
+  if (s.includes('@')) { 
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return null; 
+    return { kind: 'email', norm: s.toLowerCase(), raw: s }; 
+  }
+  const d = s.replace(/\D/g, ''); 
+  if (d.length < 6 || d.length > 16) return null;
+  return { kind: 'phone', norm: d.length >= 9 ? d.slice(-9) : d, digits: d, raw: s };
 }
 async function handleHash(kind, norm) {
   const hh = new Uint8Array(await subtle.digest('SHA-256', enc.encode('bluvane-lookup|' + kind + '|' + norm)));
@@ -220,26 +223,63 @@ async function handleHash(kind, norm) {
 async function findByHandle(raw) {
   const p = parseHandle(raw); if (!p) return { error: true };
   const hid = await handleHash(p.kind, p.norm);
-  try { const d = await DB.doc('lookup/' + hid).get(); if (d.exists) { const uid = d.data().uid; if (uid && S.keys.has(uid)) return { id: uid, kind: p.kind }; } } catch { /* fall through */ }
+  let uid = null;
+  // 1) Hash-based direct lookup
   try {
-    const u = await USER.lookup(String(raw).trim());
-    if (u) { S.names.set(u.id, u.name || 'Someone'); if (S.keys.has(u.id)) return { id: u.id, kind: p.kind }; return { id: null, kind: p.kind, pending: u.name || 'They' }; }
+    const d = await DB.doc('lookup/' + hid).get();
+    if (d.exists && d.data() && d.data().uid) uid = d.data().uid;
+  } catch { /* fall through */ }
+  // 2) Server-side user directory lookup (handles email and phone variations)
+  let sUser = null;
+  try {
+    sUser = await USER.lookup(p.raw || String(raw).trim());
+    if (sUser && sUser.id) uid = sUser.id;
   } catch { /* ignore */ }
-  return { id: null, kind: p.kind };
+  if (!uid) return { id: null, kind: p.kind };
+
+  // Cache or resolve name
+  if (sUser && sUser.name) S.names.set(uid, sUser.name);
+  else await resolveNames([uid]);
+
+  // Load public key immediately if on server
+  let hasKey = S.keys.has(uid);
+  if (!hasKey) {
+    try {
+      const kd = await DB.doc('keys/' + uid).get();
+      if (kd.exists && kd.data().pub) {
+        S.keys.set(uid, { pub: kd.data().pub, ts: kd.data().ts || 0 });
+        hasKey = true;
+      }
+    } catch { /* ignore */ }
+  }
+
+  return {
+    id: uid,
+    kind: p.kind,
+    name: S.names.get(uid) || (sUser ? sUser.name : 'Contact'),
+    email: sUser ? sUser.email : (p.kind === 'email' ? p.norm : ''),
+    phone: sUser ? sUser.phone : (p.kind === 'phone' ? p.raw : ''),
+    hasKey
+  };
 }
 async function loadContacts() {
-  try { const d = await DB.doc('data/users/' + S.uid + '/contacts').get(); S.contacts = new Map(Object.entries(d.exists ? (d.data().ids || {}) : {})); } catch { /* keep current */ }
+  try {
+    const d = await DB.doc('data/users/' + S.uid + '/contacts').get();
+    S.contacts = new Map(Object.entries(d.exists ? (d.data().ids || {}) : {}));
+  } catch { /* keep current */ }
   renderLists();
 }
 const saveContacts = () => DB.doc('data/users/' + S.uid + '/contacts').set({ ids: Object.fromEntries(S.contacts) });
-async function addContact(id) {
-  if (id === S.uid || S.contacts.has(id)) return true;
-  S.contacts.set(id, Date.now()); renderLists();
+async function addContact(id, meta = {}) {
+  if (id === S.uid) return false;
+  const now = Date.now();
+  const entry = typeof meta === 'object' && meta !== null ? { ...meta, ts: now } : { ts: now };
+  S.contacts.set(id, entry); renderLists();
   try { await saveContacts(); return true; } catch { S.contacts.delete(id); renderLists(); toast('Could not save contact.'); return false; }
 }
 async function removeContact(id) {
-  const ts = S.contacts.get(id); S.contacts.delete(id); renderLists();
-  try { await saveContacts(); toast('Contact removed.'); } catch { S.contacts.set(id, ts); renderLists(); toast('Could not remove contact.'); }
+  const prev = S.contacts.get(id); S.contacts.delete(id); renderLists();
+  try { await saveContacts(); toast('Contact removed.'); } catch { S.contacts.set(id, prev); renderLists(); toast('Could not remove contact.'); }
 }
 async function loadProfile() {
   if (S.prof) return S.prof;
@@ -286,8 +326,21 @@ const dmId = (a, b) => 'dm_' + sanitizeId([a, b].sort().join('_'));
 const chatById = (id) => S.chats.get(id) || S.virtual.get(id) || null;
 const dmPeer = (c) => c.members.find(m => m !== S.uid) || S.uid;
 function chatTitle(c) { if (c.type === 'group') return c.name || 'Group'; const p = dmPeer(c); return p === S.uid ? 'Notes to self' : nameOf(p); }
-const isUnread = (c) => c.lastBy && c.lastBy !== S.uid && (c.lastTs || 0) > (S.read[c.id] || 0);
-async function pubOf(uid) { const e = S.keys.get(uid); if (!e) return null; if (!e.ck) e.ck = await C.importPub(e.pub); return e.ck; }
+async function pubOf(uid) {
+  let e = S.keys.get(uid);
+  if (!e) {
+    try {
+      const kd = await DB.doc('keys/' + uid).get();
+      if (kd.exists && kd.data().pub) {
+        e = { pub: kd.data().pub, ts: kd.data().ts || 0 };
+        S.keys.set(uid, e);
+      }
+    } catch { /* ignore */ }
+  }
+  if (!e) return null;
+  if (!e.ck) e.ck = await C.importPub(e.pub);
+  return e.ck;
+}
 async function chatKey(chat) {
   if (S.keyCache.has(chat.id)) return S.keyCache.get(chat.id);
   let key;
@@ -466,7 +519,10 @@ function openChat(id) {
 }
 function openDm(peer) {
   const id = dmId(S.uid, peer);
-  if (!S.chats.has(id) && !S.virtual.has(id)) S.virtual.set(id, { id, type: 'dm', members: peer === S.uid ? [S.uid, S.uid] : [S.uid, peer], virtual: true });
+  if (!S.chats.has(id) && !S.virtual.has(id)) {
+    S.virtual.set(id, { id, type: 'dm', members: peer === S.uid ? [S.uid, S.uid] : [S.uid, peer], virtual: true });
+  }
+  S.tab = 'chats';
   openChat(id);
 }
 async function decryptDocs(chatId) {
@@ -563,30 +619,57 @@ function renderLists() {
   const nb = $('#noticeBadge'); nb.hidden = !unseen || S.tab === 'notices'; nb.textContent = unseen;
   const rows = [];
   if (S.tab === 'chats') {
-    const chats = [...S.chats.values()].filter(c => !q || chatTitle(c).toLowerCase().includes(q)).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+    const allChats = [...S.chats.values()];
+    for (const [vid, vc] of S.virtual.entries()) {
+      if (!allChats.some(c => c.id === vid)) allChats.unshift(vc);
+    }
+    const chats = allChats.filter(c => !q || chatTitle(c).toLowerCase().includes(q)).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
     for (const c of chats) {
       const peer = c.type === 'dm' ? dmPeer(c) : null, title = chatTitle(c);
       rows.push(h('button', { class: 'item' + (c.id === S.activeId ? ' on' : ''), onclick: () => openChat(c.id) },
         c.type === 'group' ? avatar(c.id, title, 46, false, c.emoji || '') : avatar(peer, title, 46, peer !== S.uid && S.online.has(peer)),
-        h('div', { class: 'meta' }, h('b', null, title), h('small', null, c.type === 'group' ? `${c.members.length} members · encrypted` : 'Private · end-to-end encrypted')),
+        h('div', { class: 'meta' }, h('b', null, title), h('small', null, c.type === 'group' ? `${c.members.length} members · encrypted` : (c.virtual ? 'New conversation · ready to message' : 'Private · end-to-end encrypted'))),
         h('div', { class: 'when' }, c.lastTs ? fmtDay(c.lastTs) === 'Today' ? fmtTime(c.lastTs) : fmtDay(c.lastTs) : '', isUnread(c) ? h('div', null, h('span', { class: 'unread', 'aria-label': 'Unread' })) : null)));
     }
-    if (!rows.length) rows.push(h('div', { class: 'empty-list' }, q ? 'No chats match.' : 'No chats yet. Add a friend by email or phone number to start chatting.', h('div', { style: 'margin-top:12px' }, h('button', { class: 'btn small', onclick: openAddContact }, 'Add a contact'))));
+    if (!rows.length) {
+      if (q && parseHandle(q)) {
+        rows.push(h('div', { class: 'empty-list' },
+          h('p', null, `No chats match "${q}".`),
+          h('button', { class: 'btn small', onclick: () => openAddContact(q) }, ic('search', 16), `Find "${q}" on Bluvane`)
+        ));
+      } else {
+        rows.push(h('div', { class: 'empty-list' }, q ? 'No chats match.' : 'No chats yet. Add a friend by email or phone number to start chatting.', h('div', { style: 'margin-top:12px' }, h('button', { class: 'btn small', onclick: () => openAddContact() }, ic('user-plus', 16), 'Start a new chat'))));
+      }
+    }
   } else if (S.tab === 'people') {
-    const ids = [...S.keys.keys()].filter(id => id !== S.uid);
-    const people = ids.map(id => ({ id, name: nameOf(id) })).filter(p => !q || p.name.toLowerCase().includes(q)).sort((a, b) => (S.online.has(b.id) - S.online.has(a.id)) || a.name.localeCompare(b.name));
-    rows.push(h('div', { style: 'padding:6px 8px 8px' }, h('button', { class: 'btn block', onclick: openAddContact }, ic('user-plus', 18), 'Add contact by email or phone')));
+    const allIds = new Set([...S.keys.keys(), ...S.contacts.keys()]);
+    allIds.delete(S.uid);
+    const ids = [...allIds];
+    const people = ids.map(id => ({ id, name: nameOf(id) })).filter(p => !q || p.name.toLowerCase().includes(q) || (S.contacts.get(p.id) && String(S.contacts.get(p.id).handle || '').toLowerCase().includes(q))).sort((a, b) => (S.online.has(b.id) - S.online.has(a.id)) || a.name.localeCompare(b.name));
+    rows.push(h('div', { style: 'padding:6px 8px 8px' }, h('button', { class: 'btn block', onclick: () => openAddContact() }, ic('user-plus', 18), 'Add contact by email or phone')));
     if (!q || 'notes to self'.includes(q)) rows.push(h('button', { class: 'item', onclick: () => openDm(S.uid) }, avatar(S.uid, S.me.name, 46, false, '📝'), h('div', { class: 'meta' }, h('b', null, 'Notes to self'), h('small', null, 'Encrypted notepad only you can read'))));
     const prow = (p, isC) => {
-      const open = h('button', { class: 'item', onclick: () => openDm(p.id) }, avatar(p.id, p.name, 46, S.online.has(p.id)), h('div', { class: 'meta' }, h('b', null, p.name), h('small', null, S.online.has(p.id) ? 'Online now' : 'Tap to message privately')));
+      const cMeta = S.contacts.get(p.id);
+      const sub = S.online.has(p.id) ? 'Online now' : (cMeta && cMeta.handle ? cMeta.handle : (S.keys.has(p.id) ? 'End-to-end encrypted · Tap to chat' : 'Account found · Key setup pending'));
+      const open = h('button', { class: 'item', onclick: () => openDm(p.id) }, avatar(p.id, p.name, 46, S.online.has(p.id)), h('div', { class: 'meta' }, h('b', null, p.name), h('small', null, sub)));
+      const chatBtn = h('button', { class: 'btn small', title: 'Chat with ' + p.name, onclick: (e) => { e.stopPropagation(); openDm(p.id); } }, 'Chat');
       const act = h('button', { class: 'btn ghost small', 'aria-label': (isC ? 'Remove ' : 'Add ') + p.name }, isC ? 'Remove' : '+ Add');
-      if (isC) armBtn(act, 'Sure?', () => removeContact(p.id)); else act.addEventListener('click', async () => { if (await addContact(p.id)) toast(p.name + ' added to contacts.'); });
-      return h('div', { class: 'item-wrap' }, open, act);
+      if (isC) armBtn(act, 'Sure?', () => removeContact(p.id)); else act.addEventListener('click', async (e) => { e.stopPropagation(); if (await addContact(p.id)) toast(p.name + ' added to contacts.'); });
+      return h('div', { class: 'item-wrap' }, open, chatBtn, act);
     };
     const cons = people.filter(p => S.contacts.has(p.id)), others = people.filter(p => !S.contacts.has(p.id));
-    if (cons.length) { rows.push(h('div', { class: 'sec-lbl' }, 'Contacts')); cons.forEach(p => rows.push(prow(p, true))); }
+    if (cons.length) { rows.push(h('div', { class: 'sec-lbl' }, `Contacts (${cons.length})`)); cons.forEach(p => rows.push(prow(p, true))); }
     if (others.length) { rows.push(h('div', { class: 'sec-lbl' }, cons.length ? 'Others on Bluvane' : 'On Bluvane')); others.forEach(p => rows.push(prow(p, false))); }
-    if (!people.length) rows.push(h('div', { class: 'empty-list' }, q ? 'Nobody matches.' : 'Nobody else has joined yet. Add a friend by email or phone, then they will appear here.'));
+    if (!people.length) {
+      if (q && parseHandle(q)) {
+        rows.push(h('div', { class: 'empty-list' },
+          h('p', null, `Nobody matches "${q}".`),
+          h('button', { class: 'btn small', onclick: () => openAddContact(q) }, ic('search', 16), `Find "${q}" on Bluvane`)
+        ));
+      } else {
+        rows.push(h('div', { class: 'empty-list' }, q ? 'Nobody matches.' : 'No contacts yet. Tap the button above to add friends by email or phone.'));
+      }
+    }
   } else {
     if (!S.notices.length) rows.push(h('div', { class: 'empty-list' }, 'No notices from the admin yet.'));
     for (const n of S.notices) rows.push(h('div', { class: 'notice' }, h('small', { class: 'muted' }, new Date(n.ts).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })), h('p', null, n.text)));
@@ -689,27 +772,91 @@ function autoGrow() { const b = $('#msg'); b.style.height = 'auto'; b.style.heig
 let lastTypingEmit = 0;
 
 /* ---------- Modals ---------- */
-function openAddContact() {
-  const inp = h('input', { class: 'field', type: 'text', placeholder: 'name@email.com or +256 772 000 000', autocomplete: 'off', 'aria-label': 'Email or phone number' });
-  const go = h('button', { class: 'btn block', style: 'margin-top:10px' }, ic('search', 16), 'Find'), out = h('div', { style: 'margin-top:12px' });
+function openAddContact(initialQuery = '') {
+  const inp = h('input', { class: 'field', type: 'text', placeholder: 'name@email.com or +256 772 000 000', autocomplete: 'off', 'aria-label': 'Email or phone number', value: initialQuery });
+  const go = h('button', { class: 'btn block', style: 'margin-top:10px' }, ic('search', 16), 'Find & Chat');
+  const out = h('div', { style: 'margin-top:14px' });
+  const savedSec = h('div', { style: 'margin-top:20px;border-top:1px solid var(--border);padding-top:14px' });
+
+  const renderSaved = () => {
+    savedSec.replaceChildren();
+    if (!S.contacts.size) return;
+    savedSec.append(h('div', { class: 'sec-lbl', style: 'padding-left:0' }, `Your Saved Contacts (${S.contacts.size})`));
+    for (const id of S.contacts.keys()) {
+      const name = nameOf(id), cMeta = S.contacts.get(id);
+      const sub = cMeta && cMeta.handle ? cMeta.handle : (S.keys.has(id) ? 'End-to-end encrypted' : 'Account found');
+      const chatB = h('button', { class: 'btn small' }, 'Chat');
+      chatB.onclick = () => { close(); openDm(id); };
+      savedSec.append(h('div', { class: 'row-line' },
+        avatar(id, name, 38, S.online.has(id)),
+        h('div', { class: 'grow' }, h('b', null, name), h('small', { class: 'muted' }, sub)),
+        chatB
+      ));
+    }
+  };
+
   const run = async () => {
     out.replaceChildren(); const raw = inp.value.trim(); if (!raw) return;
-    go.disabled = true; const r = await findByHandle(raw); go.disabled = false;
-    if (r.error) return out.append(h('div', { class: 'err' }, 'Enter a valid email address or phone number.'));
-    if (r.id === S.uid) return out.append(h('div', { class: 'muted' }, 'That’s you! Open People → Notes to self to message yourself.'));
-    if (!r.id) return out.append(h('div', { class: 'notice', style: 'margin:0' }, h('b', null, r.pending ? `${r.pending} has not set up Bluvane yet` : 'No Bluvane account found'),
-      h('p', { class: 'muted' }, r.pending ? 'Try again once they have opened the app and created their key.' : 'They need to open Bluvane and finish setup' + (r.kind === 'phone' ? ', then add this number under Settings → Find me by.' : ', signed in with this email.'))));
-    await resolveNames([r.id]); const name = nameOf(r.id), has = S.contacts.has(r.id);
-    const msgB = h('button', { class: 'btn small' }, 'Message'), saveB = h('button', { class: 'btn ghost small' }, has ? 'In contacts ✓' : 'Save contact');
+    go.disabled = true; go.textContent = 'Searching…';
+    const r = await findByHandle(raw);
+    go.disabled = false; go.replaceChildren(ic('search', 16), 'Find & Chat');
+    if (r.error) return out.append(h('div', { class: 'err' }, 'Please enter a valid email address or phone number.'));
+    if (r.id === S.uid) return out.append(h('div', { class: 'notice' }, h('b', null, 'That is your own account!'), h('p', { class: 'muted' }, 'Open People → Notes to self to keep encrypted private notes for yourself.')));
+    if (!r.id) {
+      return out.append(h('div', { class: 'notice', style: 'margin:0' },
+        h('b', null, 'No Bluvane account found'),
+        h('p', { class: 'muted' }, `No user registered with ${r.kind === 'email' ? 'email' : 'phone'} "${raw}". Friends can sign up, then you can find them here!`)
+      ));
+    }
+
+    const name = r.name || nameOf(r.id), has = S.contacts.has(r.id);
+    const handleText = r.email ? r.email : (r.phone ? r.phone : (r.kind === 'email' ? 'Email: ' + raw : 'Phone: ' + raw));
+    const statusText = r.hasKey ? '🔒 End-to-end encrypted · ready to chat' : '⏳ Key setup pending (open chat once they unlock)';
+    
+    const msgB = h('button', { class: 'btn small' }, 'Chat now');
+    const saveB = h('button', { class: 'btn ghost small' }, has ? 'In contacts ✓' : '+ Save contact');
     saveB.disabled = has;
-    msgB.addEventListener('click', async () => { await addContact(r.id); close(); S.tab = 'chats'; openDm(r.id); });
-    saveB.addEventListener('click', async () => { if (await addContact(r.id)) { saveB.textContent = 'Saved ✓'; saveB.disabled = true; } });
-    out.append(h('div', { class: 'row-line' }, avatar(r.id, name, 40), h('div', { class: 'grow' }, h('b', null, name), h('small', { class: 'muted' }, 'On Bluvane · ' + (r.kind === 'email' ? 'found by email' : 'found by phone'))), msgB, saveB));
+    
+    msgB.addEventListener('click', async () => {
+      await addContact(r.id, { handle: handleText, kind: r.kind });
+      close();
+      openDm(r.id);
+    });
+    saveB.addEventListener('click', async () => {
+      if (await addContact(r.id, { handle: handleText, kind: r.kind })) {
+        saveB.textContent = 'In contacts ✓';
+        saveB.disabled = true;
+        toast(name + ' saved to contacts.');
+        renderSaved();
+      }
+    });
+
+    out.append(h('div', { class: 'card', style: 'padding:14px;background:var(--surface-2);border-radius:16px;box-shadow:none;margin-top:6px' },
+      h('div', { style: 'display:flex;align-items:center;gap:12px' },
+        avatar(r.id, name, 46, S.online.has(r.id)),
+        h('div', { class: 'grow' },
+          h('b', { style: 'font-size:16px' }, name),
+          h('div', { class: 'tiny muted' }, handleText),
+          h('div', { class: 'tiny', style: 'color:' + (r.hasKey ? 'var(--ok)' : 'var(--warn)') + ';margin-top:2px' }, statusText)
+        )
+      ),
+      h('div', { style: 'display:flex;gap:8px;margin-top:14px' }, msgB, saveB)
+    ));
   };
-  go.addEventListener('click', run); inp.addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
-  const body = h('div', null, h('p', { class: 'muted', style: 'margin:0 0 10px' }, 'Type the email or phone number your friend uses for Bluvane. They appear here once they have joined.'), inp, go, out,
-    h('p', { class: 'tiny muted', style: 'margin-top:14px' }, 'Tip: for phone numbers, include the country code. Friends can add their number in Settings → Find me by.'));
-  const close = openModal('Add contact', body); inp.focus();
+
+  go.addEventListener('click', run);
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+
+  const body = h('div', null,
+    h('p', { class: 'muted', style: 'margin:0 0 10px' }, 'Add someone by email address or phone number to start a private 1-on-1 encrypted chat.'),
+    inp, go, out, savedSec,
+    h('p', { class: 'tiny muted', style: 'margin-top:14px' }, 'Tip: phone numbers match with or without country code. Friends can also add their number in Settings.')
+  );
+
+  const close = openModal('New Chat / Add Contact', body);
+  renderSaved();
+  inp.focus();
+  if (initialQuery) run();
 }
 async function openSafety() {
   const chat = chatById(S.activeId); if (!chat || chat.type !== 'dm') return;
@@ -832,7 +979,9 @@ function wire() {
   $('#btnTheme').addEventListener('click', () => { ls.set('theme', effectiveTheme() === 'dark' ? 'light' : 'dark'); applyTheme(); });
   $('#btnSettings').addEventListener('click', openSettings);
   $('#btnAdmin').addEventListener('click', openAdmin);
-  $('#btnAddContact').addEventListener('click', openAddContact);
+  $('#btnAddContact').addEventListener('click', () => openAddContact());
+  const btnNewChat = $('#btnNewChat'); if (btnNewChat) btnNewChat.addEventListener('click', () => openAddContact());
+  const btnEmptyStart = $('#btnEmptyStart'); if (btnEmptyStart) btnEmptyStart.addEventListener('click', () => openAddContact());
   $('#btnLock').addEventListener('click', lockNow);
   $('#btnNewGroup').addEventListener('click', openNewGroup);
   $('#btnBack').addEventListener('click', () => { $('#app').dataset.view = 'list'; });
